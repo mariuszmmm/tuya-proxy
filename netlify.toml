@@ -2,6 +2,16 @@
 [build]
   functions = "netlify/functions"
 
+[dev]
+  # Public accessible port (zmieniony z 8888 bo zajęty)
+  port = 8889
+  # Port dla funkcji (unikamy kolizji 3999) – ustaw inny np. 9001
+  functionsPort = 9001
+  # Port serwera statycznego (wcześniej 3999 kolidował) – zmieniamy na 4100
+  staticServerPort = 4100
+  # Opcjonalnie: włącz szczegółowe logi
+  autoLaunch = false
+
 [[redirects]]
   from = "/tuya"
   to = "/.netlify/functions/tuya-proxy"

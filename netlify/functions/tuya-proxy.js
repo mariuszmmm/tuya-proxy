@@ -9,100 +9,139 @@ const tokenCache = {
   expires: 0,
 };
 
+console.log("🔑 Funkcja Tuya Proxy zainicjalizowana");
+
+// Pobieranie tokena wg aktualnej specyfikacji Tuya Cloud:
+// GET /v1.0/token?grant_type=1 z podpisem HMAC(clientId + t)
 async function getAccessToken() {
   const now = Date.now();
-
   if (tokenCache.token && now < tokenCache.expires) {
-    console.log("✔️ Using cached Tuya token");
+    console.log("✔️ Używam zcache'owanego tokena Tuya");
     return tokenCache.token;
   }
 
-  const url = `https://${process.env.TUYA_API_HOST}/v1.0/token?grant_type=1`;
-  console.log("→ Fetching new Tuya access token:", url);
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      username: process.env.TUYA_USERNAME,
-      password: process.env.TUYA_PASSWORD,
-    }),
-  });
-
-  console.log(`← Token endpoint responded with status ${res.status}`);
-
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error("❌ Tuya token fetch error:", errText);
-    throw new Error(`Unable to fetch Tuya token: ${res.status}`);
+  const { TUYA_API_HOST, TUYA_CLIENT_ID, TUYA_SECRET } = process.env;
+  if (!TUYA_API_HOST || !TUYA_CLIENT_ID || !TUYA_SECRET) {
+    throw new Error("Brak wymaganych zmiennych: TUYA_API_HOST, TUYA_CLIENT_ID, TUYA_SECRET");
   }
 
-  const data = await res.json();
-  tokenCache.token = data.result.access_token;
-  // expire_time is seconds until expiry
-  tokenCache.expires = now + data.result.expire_time * 1000 - 60 * 1000;
-  console.log("✔️ New Tuya token acquired; expires in (ms):", data.result.expire_time * 1000);
+  const t = Date.now().toString();
+  // Algorytm kanoniczny (Tuya OpenAPI):
+  // 1. contentSha256 = SHA256(body) (pusty string dla GET bez body)
+  // 2. canonicalHeaders (tu brak dodatkowych) => pusty wiersz
+  // 3. canonicalPath z zapytaniem
+  // 4. stringToSign = METHOD + "\n" + contentSha256 + "\n" + canonicalHeaders + "\n" + pathWithQuery
+  // 5. signStr = clientId + t + stringToSign (bez access_token przy token endpoint)
+  // 6. HMAC-SHA256(signStr, secret)
+  const method = 'GET';
+  const bodyStr = '';
+  const contentSha256 = crypto.createHash('sha256').update(bodyStr).digest('hex');
+  const pathWithQuery = '/v1.0/token?grant_type=1';
+  const canonicalHeadersSection = '';
+  const stringToSignSection = [method, contentSha256, canonicalHeadersSection, pathWithQuery].join('\n');
+  const signStr = TUYA_CLIENT_ID + t + stringToSignSection;
+  const sign = crypto.createHmac('sha256', TUYA_SECRET).update(signStr).digest('hex').toUpperCase();
 
+  const url = `https://${TUYA_API_HOST}${pathWithQuery}`;
+  console.log("→ Pobieram nowy token Tuya:", url);
+  console.log("→ contentSha256:", contentSha256);
+  console.log("→ stringToSignSection:\n" + stringToSignSection);
+  console.log("→ signStr:", signStr);
+  console.log("→ sign:", sign);
+
+  const res = await fetch(url, {
+    method: method,
+    headers: {
+      client_id: TUYA_CLIENT_ID,
+      sign,
+      t,
+      sign_method: "HMAC-SHA256",
+    },
+  });
+
+  console.log(`← Odpowiedź token endpoint: ${res.status}`);
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch {
+    console.error("❌ Token response nie jest JSON:", text);
+    throw new Error("Token endpoint zwrócił nie-JSON");
+  }
+
+  if (!res.ok || data.success === false) {
+    console.error("❌ Błąd pobierania tokena payload:", data);
+    throw new Error(`Błąd tokena: ${res.status} ${data.msg || data.message || ''}`.trim());
+  }
+  if (!data.result || !data.result.access_token) {
+    console.error("❌ Brak access_token w odpowiedzi:", data);
+    throw new Error("Brak access_token w odpowiedzi token endpointu");
+  }
+
+  tokenCache.token = data.result.access_token;
+  const ttl = (data.result.expire_time || 3600) * 1000;
+  tokenCache.expires = now + ttl - 60 * 1000; // bufor 60s
+  console.log("✔️ Nowy token Tuya uzyskany; ważny (ms):", ttl);
   return tokenCache.token;
 }
 
+// Kanoniczny podpis (Tuya OpenAPI normal request):
+// stringToSignSection = METHOD\n + SHA256(body)\n + (canonical headers puste) + \n + pathWithQuery
+// signStr = clientId + accessToken + t + stringToSignSection
 function generateSign(method, path, body, t, accessToken) {
   const clientId = process.env.TUYA_CLIENT_ID;
-  const nonce = Date.now().toString();
-  const payload = body ? JSON.stringify(body) : "";
-  const stringToSign = [clientId, accessToken, nonce, t, method, path, payload].join("");
-
-  console.log("→ StringToSign:", stringToSign);
-
-  const hmac = crypto
-    .createHmac("sha256", process.env.TUYA_SECRET)
-    .update(stringToSign)
-    .digest("hex")
-    .toUpperCase();
-
-  console.log("✔️ Generated HMAC-SHA256 sign:", hmac);
-  return { sign: hmac, nonce };
+  const bodyStr = body ? JSON.stringify(body) : "";
+  const contentSha256 = crypto.createHash('sha256').update(bodyStr).digest('hex');
+  const methodUpper = method.toUpperCase();
+  const canonicalHeadersSection = ""; // brak dodatkowych nagłówków kanonicznych w tej prostej wersji
+  const stringToSignSection = [methodUpper, contentSha256, canonicalHeadersSection, path].join('\n');
+  const signStr = clientId + accessToken + t + stringToSignSection;
+  const sign = crypto.createHmac('sha256', process.env.TUYA_SECRET).update(signStr).digest('hex').toUpperCase();
+  console.log("→ contentSha256:", contentSha256);
+  console.log("→ stringToSignSection:\n" + stringToSignSection);
+  console.log("→ signStr:", signStr);
+  console.log("✔️ Wygenerowano podpis HMAC-SHA256:", sign);
+  return { sign };
 }
 
 export async function handler(event) {
   console.log(">>> Incoming event:", event);
 
-  let payload;
-  try {
-    payload = JSON.parse(event.body);
-  } catch (err) {
-    console.error("❌ Invalid JSON payload:", err.message);
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: "Invalid JSON body" }),
-    };
+  // Health check GET /tuya bez body
+  if (event.httpMethod === 'GET' && !event.body) {
+    return { statusCode: 200, body: JSON.stringify({ ok: true, message: 'Tuya proxy działa' }) };
+  }
+
+  let payload = {};
+  if (event.body) {
+    try {
+      payload = JSON.parse(event.body);
+    } catch (err) {
+      console.error("❌ Błędny JSON:", err.message);
+      return { statusCode: 400, body: JSON.stringify({ error: "Błędny JSON w body" }) };
+    }
+  } else {
+    return { statusCode: 400, body: JSON.stringify({ error: "Brak body JSON" }) };
   }
 
   const { path, method = "GET", body } = payload;
   if (!path) {
-    console.error("❌ Missing 'path' in request body");
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: "Missing 'path' parameter" }),
-    };
+    console.error("❌ Brak 'path' w body");
+    return { statusCode: 400, body: JSON.stringify({ error: "Brak parametru 'path'" }) };
   }
 
-  console.log(`→ Calling Tuya API: [${method}] ${path}`);
+  console.log(`→ Wywołanie Tuya API: [${method}] ${path}`);
 
   try {
     const t = Date.now().toString();
     const accessToken = await getAccessToken();
-    const { sign, nonce } = generateSign(method, path, body, t, accessToken);
+    const { sign } = generateSign(method, path, body, t, accessToken);
 
     const url = `https://${process.env.TUYA_API_HOST}${path}`;
     const headers = {
       client_id: process.env.TUYA_CLIENT_ID,
       sign,
       t,
-      nonce,
       sign_method: "HMAC-SHA256",
+      sign_version: "1.0",
       access_token: accessToken,
       "Content-Type": "application/json",
     };
